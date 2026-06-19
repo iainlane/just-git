@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { RealGit } from "../real-git";
-import { normalizeRebaseField } from "./compare";
+import { normalizeRebaseField, type WorktreeSnapshot } from "./compare";
 
 /**
  * Run `git` with the given arguments in a repo directory under an isolated
@@ -291,6 +291,46 @@ async function captureStashHashes(
 	return result.stdout.trim().split("\n");
 }
 
+// ── Linked worktrees ─────────────────────────────────────────────
+
+/**
+ * Capture each linked worktree's private HEAD, keyed by its admin-dir id
+ * (the directory name under `.git/worktrees`). The id is path-agnostic, so a
+ * real-git temp checkout and the in-memory VFS produce comparable keys. A
+ * worktree on a branch resolves the (shared) branch tip; a detached one
+ * reports the commit its HEAD pins directly.
+ */
+async function captureWorktrees(
+	repoDir: string,
+	env?: Record<string, string>,
+): Promise<WorktreeSnapshot[]> {
+	const worktreesDir = `${repoDir}/.git/worktrees`;
+	let ids: string[];
+	try {
+		ids = await readdir(worktreesDir);
+	} catch {
+		return [];
+	}
+
+	const snapshots: WorktreeSnapshot[] = [];
+	for (const id of ids.sort()) {
+		const raw = await safeReadFile(`${worktreesDir}/${id}/HEAD`);
+		if (raw === null) continue;
+		const head = raw.trim();
+
+		if (!head.startsWith("ref: ")) {
+			snapshots.push({ id, headRef: null, headSha: head });
+			continue;
+		}
+
+		const ref = head.slice("ref: ".length);
+		const resolved = await run(["rev-parse", ref], repoDir, env);
+		const headSha = resolved.exitCode === 0 ? resolved.stdout.trim() : null;
+		snapshots.push({ id, headRef: head, headSha });
+	}
+	return snapshots;
+}
+
 // ── Full snapshot capture ────────────────────────────────────────
 
 export interface GitSnapshot {
@@ -302,6 +342,8 @@ export interface GitSnapshot {
 	workTreeHash: string;
 	/** Stash commit hashes in stack order (newest first). */
 	stashHashes: string[];
+	/** Linked worktrees' private HEADs, sorted by admin id. */
+	worktrees: WorktreeSnapshot[];
 }
 
 /**
@@ -316,13 +358,14 @@ export async function captureSnapshot(
 	repoDir: string,
 	env?: Record<string, string>,
 ): Promise<GitSnapshot> {
-	const [head, refs, index, operation, workTreeHash, stashHashes] = await Promise.all([
+	const [head, refs, index, operation, workTreeHash, stashHashes, worktrees] = await Promise.all([
 		captureHead(repoDir, env),
 		captureRefs(repoDir, env),
 		captureIndex(repoDir, env),
 		captureOperation(repoDir),
 		hashWorkTree(repoDir),
 		captureStashHashes(repoDir, env),
+		captureWorktrees(repoDir, env),
 	]);
-	return { head, refs, index, operation, workTreeHash, stashHashes };
+	return { head, refs, index, operation, workTreeHash, stashHashes, worktrees };
 }
